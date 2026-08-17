@@ -1,0 +1,207 @@
+# MarketPulse — Docker Compose
+# Déploiement complet sur Oracle Cloud Free Tier (A1.Flex 4 OCPU / 24 GB RAM)
+
+services:
+
+  # ─── Base de données PostgreSQL ─────────────────────────────────────────
+  postgres:
+    image: postgres:15-alpine
+    container_name: marketpulse_postgres_v2
+    environment:
+      POSTGRES_USER: marketpulse
+      POSTGRES_PASSWORD: mp_secure_2024
+      POSTGRES_DB: marketpulse_db
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U marketpulse -d marketpulse_db"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: always
+
+  # ─── MLflow Tracking Server ──────────────────────────────────────────────
+  mlflow:
+    image: ghcr.io/mlflow/mlflow:latest
+    container_name: marketpulse_mlflow_v2
+    ports:
+      - "5000:5000"
+    volumes:
+      - ./mlflow_data:/mlflow
+    environment:
+      - MLFLOW_TRACKING_URI=http://marketpulse_mlflow_v2:5000
+    command: >
+      mlflow server
+      --backend-store-uri sqlite:////mlflow/mlflow.db
+      --default-artifact-root /mlflow/artifacts
+      --host 0.0.0.0
+      --port 5000
+      --allowed-hosts "*"
+    restart: always
+
+# — Apache Airflow : Service d'initialisation automatique —
+  airflow-init:
+    image: apache/airflow:2.10.0
+    container_name: marketpulse-airflow-init
+    depends_on:
+      postgres:
+        condition: service_healthy
+    volumes: &airflow-volumes # <--- MODIFIÉ : Ancre de volumes définie ici pour monter les répertoires dès la phase d'init
+      - ./dags:/opt/airflow/dags
+      - ./collectors:/opt/airflow/dags/collectors
+      - ./nlp:/opt/airflow/dags/nlp
+      - ./logs:/opt/airflow/logs
+      - ./data:/opt/airflow/data
+      - ./exports:/opt/airflow/exports
+      - ./.git:/opt/airflow/.git:ro # <--- AJOUT CRUCIAL pour la traçabilité Git MLflow
+      - ./models:/opt/airflow/models
+    environment:
+      AIRFLOW__CORE__EXECUTOR: LocalExecutor
+      AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://marketpulse:mp_secure_2024@marketpulse_postgres_v2:5432/marketpulse_db
+      AIRFLOW__CORE__LOAD_EXAMPLES: 'False'
+      AIRFLOW__WEBSERVER__SECRET_KEY: marketpulse_secret_key_2024
+      AIRFLOW__LOGGING__LOGGING_LEVEL: INFO
+      BRONZE_PATH: /opt/airflow/data/bronze
+      SILVER_PATH: /opt/airflow/data/silver
+      GOLD_PATH: /opt/airflow/data/gold
+      MLFLOW_TRACKING_URI: http://marketpulse_mlflow_v2:5000
+      _AIRFLOW_DB_UPGRADE: 'true'
+      _AIRFLOW_WWW_USER_CREATE: 'true'
+      _AIRFLOW_WWW_USER_USERNAME: admin
+      _AIRFLOW_WWW_USER_PASSWORD: admin
+      HF_HOME: /opt/airflow/models
+      TRANSFORMERS_CACHE: /opt/airflow/models
+      AIRFLOW__SMTP__SMTP_HOST: smtp.mail.yahoo.com
+      AIRFLOW__SMTP__SMTP_USER: rayen_rezgui@yahoo.com
+      AIRFLOW__SMTP__SMTP_PASSWORD: nxqaempyujumeqar
+      AIRFLOW__SMTP__SMTP_PORT: 587
+      AIRFLOW__SMTP__SMTP_MAIL_FROM: rayen_rezgui@yahoo.com
+      AIRFLOW__SMTP__SMTP_STARTTLS: 'True'
+      AIRFLOW__SMTP__SMTP_SSL: 'False'
+      AIRFLOW__EMAIL__EMAIL_BACKEND: airflow.utils.email.send_email_smtp
+    command: version
+
+  # — Apache Airflow : Webserver —
+  airflow-webserver:
+    build: .
+    container_name: marketpulse-airflow-webserver-1
+    command: airflow webserver
+    ports:
+      - "8080:8080"
+    volumes: *airflow-volumes
+    environment:
+      - AIRFLOW__CORE__EXECUTOR=LocalExecutor
+      - AIRFLOW__DATABASE__SQL_ALCHEMY_CONN=postgresql+psycopg2://marketpulse:mp_secure_2024@marketpulse_postgres_v2:5432/marketpulse_db
+      - AIRFLOW__CORE__LOAD_EXAMPLES=False
+      - AIRFLOW__WEBSERVER__SECRET_KEY=marketpulse_secret_key_2024
+      - AIRFLOW__LOGGING__LOGGING_LEVEL=INFO
+      - BRONZE_PATH=/opt/airflow/data/bronze
+      - SILVER_PATH=/opt/airflow/data/silver
+      - GOLD_PATH=/opt/airflow/data/gold
+      - MLFLOW_TRACKING_URI=http://marketpulse_mlflow_v2:5000
+      - GIT_PYTHON_REFRESH=quiet
+      - HF_HOME=/opt/airflow/models
+      - TRANSFORMERS_CACHE=/opt/airflow/models
+      - AIRFLOW__SMTP__SMTP_HOST=smtp.mail.yahoo.com
+      - AIRFLOW__SMTP__SMTP_USER=rayen_rezgui@yahoo.com
+      - AIRFLOW__SMTP__SMTP_PASSWORD=nxqaempyujumeqar
+      - AIRFLOW__SMTP__SMTP_PORT=587
+      - AIRFLOW__SMTP__SMTP_MAIL_FROM=rayen_rezgui@yahoo.com
+      - AIRFLOW__SMTP__SMTP_STARTTLS=True
+      - AIRFLOW__SMTP__SMTP_SSL=False
+      - AIRFLOW__EMAIL__EMAIL_BACKEND=airflow.utils.email.send_email_smtp
+    depends_on:
+      postgres:
+        condition: service_healthy
+      airflow-init:
+        condition: service_completed_successfully
+    restart: always
+
+  # — Apache Airflow : Scheduler —
+  airflow-scheduler:
+    build: .
+    container_name: marketpulse-airflow-scheduler-1
+    command: airflow scheduler
+    volumes: *airflow-volumes
+    environment:
+      - AIRFLOW__CORE__EXECUTOR=LocalExecutor
+      - AIRFLOW__DATABASE__SQL_ALCHEMY_CONN=postgresql+psycopg2://marketpulse:mp_secure_2024@marketpulse_postgres_v2:5432/marketpulse_db
+      - AIRFLOW__CORE__LOAD_EXAMPLES=False
+      - AIRFLOW__WEBSERVER__SECRET_KEY=marketpulse_secret_key_2024
+      - AIRFLOW__LOGGING__LOGGING_LEVEL=INFO
+      - BRONZE_PATH=/opt/airflow/data/bronze
+      - SILVER_PATH=/opt/airflow/data/silver
+      - GOLD_PATH=/opt/airflow/data/gold
+      - MLFLOW_TRACKING_URI=http://marketpulse_mlflow_v2:5000
+      - GIT_PYTHON_REFRESH=quiet
+      - HF_HOME=/opt/airflow/models
+      - TRANSFORMERS_CACHE=/opt/airflow/models
+      - AIRFLOW__SMTP__SMTP_HOST=smtp.mail.yahoo.com
+      - AIRFLOW__SMTP__SMTP_USER=rayen_rezgui@yahoo.com
+      - AIRFLOW__SMTP__SMTP_PASSWORD=nxqaempyujumeqar
+      - AIRFLOW__SMTP__SMTP_PORT=587
+      - AIRFLOW__SMTP__SMTP_MAIL_FROM=rayen_rezgui@yahoo.com
+      - AIRFLOW__SMTP__SMTP_STARTTLS=True
+      - AIRFLOW__SMTP__SMTP_SSL=False
+      - AIRFLOW__EMAIL__EMAIL_BACKEND=airflow.utils.email.send_email_smtp
+    depends_on:
+      postgres:
+        condition: service_healthy
+      airflow-init:
+        condition: service_completed_successfully
+    restart: always
+  # ─── FastAPI ─────────────────────────────────────────────────────────────
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile.api
+    container_name: marketpulse_api_v2
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./api:/app
+      - ./data:/app/data
+    environment:
+      - GOLD_PATH=/app/data/gold
+      - API_HOST=0.0.0.0
+      - API_PORT=8000
+    command: uvicorn main:app --host 0.0.0.0 --port 8000 --reload
+    restart: always
+
+  # ─── Local LLM Synthesizer (Ollama) ──────────────────────────────────────
+  ollama:
+    image: ollama/ollama:latest
+    container_name: marketpulse-ollama
+    environment:
+      - OLLAMA_HOST=0.0.0.0:11434 
+    ports:
+      - "11434:11434"
+    volumes:
+      - ollama_data:/root/.ollama
+    healthcheck:
+      test: ["CMD", "ollama", "list"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: always
+# ─── Ollama Auto-Pull Init (Garantie Llama 3) ─────────────────────────────
+  ollama-init:
+    image: ollama/ollama:latest
+    container_name: marketpulse-ollama-init
+    environment:
+      - OLLAMA_HOST=http://marketpulse-ollama:11434
+    depends_on:
+      ollama:
+        condition: service_healthy
+    entrypoint: ["/bin/sh", "-c", "ollama pull llama3"]
+    restart: "no"
+
+volumes:
+  postgres_data:
+  ollama_data:
+
+networks:
+  default:
+    name: marketpulse_network

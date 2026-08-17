@@ -1,0 +1,16 @@
+.env
+
+# Data, Storage & Outputs
+data/
+exports/
+models/
+logs/
+mlflow_data/
+ollama_data/
+
+# Python / Caches
+__pycache__/
+.pytest_cache/
+.DS_Store
+.idea/
+.vscode/
