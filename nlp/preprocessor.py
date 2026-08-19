@@ -14,7 +14,7 @@ import numpy as np
 import pandas as pd
 from loguru import logger
 from sentence_transformers import SentenceTransformer
-
+from nlp.utils import MULTILINGUAL_STOPWORDS
 
 SILVER_PATH = Path(os.getenv("SILVER_PATH", "./data/silver"))
 BRONZE_PATH = Path(os.getenv("BRONZE_PATH", "./data/bronze"))
@@ -74,22 +74,13 @@ def filter_article(article: dict, min_length: int = 50) -> bool:
 
 def extract_keywords(text: str, top_n: int = 10, lang: str = "fr") -> List[str]:
     """Extrait les mots-clés en supportant l'arabe et le latin."""
-    # 1. Stop words étendus (Français + Anglais + Arabe de base)
-    stop_words = {
-        "the", "a", "an", "and", "or", "but", "in", "on", "at", "to",
-        "for", "of", "with", "by", "from", "is", "are", "was", "were",
-        "be", "been", "has", "have", "had", "this", "that", "it", "its",
-        "le", "la", "les", "un", "une", "des", "de", "du", "et", "en",
-        "que", "qui", "est", "dans", "par", "sur", "au", "aux", "ce","في","هي","كما," "من", "على", "عن", "الى", "التي", "الذي", "هذا", "كان"
-    }
-    # 2. Expression régulière conditionnelle
     # [\u0600-\u06FF] capture l'alphabet arabe
     # [a-zA-ZÀ-ÿ] capture l'alphabet latin accentué
     regex = r"[\u0600-\u06FF]{3,}|[a-zA-ZÀ-ÿ]{4,}"
     words = re.findall(regex, text.lower())
     freq = {}
     for w in words:
-        if w not in stop_words:
+        if w not in MULTILINGUAL_STOPWORDS:
             freq[w] = freq.get(w, 0) + 1
     sorted_words = sorted(freq.items(), key=lambda x: x[1], reverse=True)
     return [w for w, _ in sorted_words[:top_n]]

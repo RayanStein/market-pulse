@@ -13,15 +13,12 @@ from pathlib import Path
 from datetime import datetime
 from loguru import logger
 from ollama import Client
-# Tout au début du fichier synthesizer.py (après les imports)
-MLFLOW_URI = os.getenv("MLFLOW_TRACKING_URI", "http://marketpulse_mlflow_v2:5000")
-mlflow.set_tracking_uri(MLFLOW_URI)
-mlflow.set_experiment("marketpulse_prod")
 
+
+# Initialisation légère (pas d'appel réseau synchrone au parsing)
 ollama_client = Client(host='http://ollama:11434')
-
 GOLD_PATH = Path(os.getenv("GOLD_PATH", "./data/gold"))
-
+_ollama_semaphore = asyncio.Semaphore(3)
 
 def build_cluster_prompt(cluster_label: str,
                          articles: List[dict],
@@ -143,7 +140,7 @@ Commence par "Cette veille révèle..." ou similaire."""
         # En cas d'erreur, on renvoie un rapport par défaut élégant
         return f"Rapport MarketPulse - {total_articles} articles analysés, {len(clusters_data)} thèmes identifiés."
 
-async def generate_single_cluster_async(client: httpx.AsyncClient, cluster_id: str, cluster_info: dict, cluster_articles: list, lang: str) -> tuple:
+async def generate_single_cluster_with_semaphore(client: httpx.AsyncClient, cluster_id: str, cluster_info: dict, cluster_articles: list, lang: str) -> tuple:
     """Version asynchrone d'un appel individuel à Ollama pour un cluster."""
     cluster_label = cluster_info["label"]
     
@@ -156,29 +153,31 @@ async def generate_single_cluster_async(client: httpx.AsyncClient, cluster_id: s
     Tu es un expert en veille économique et stratégique. 
     Voici une liste de titres et résumés d'articles de presse qui appartiennent au même groupe thématique '{cluster_label}' :
     {articles_text}
-    
+
     Fais un résumé global très court (maximum 2 phrases) en français pour expliquer ce qu'il se passe dans ce cluster.
     Sois direct, factuel, commence directement par le résumé, sans formules de politesse ni phrases d'introduction.
     """
-    
+
     payload = {
         "model": "llama3",
         "prompt": prompt,
         "options": {"temperature": 0.2},
         "stream": False
     }
-    
+
     try:
+      # Le sémaphore protège l'appel critique pour ne pas saturer le serveur Ollama
+      async with _ollama_semaphore:
         # Appel HTTP asynchrone direct sur l'API d'Ollama
         response = await client.post("http://ollama:11434/api/generate", json=payload, timeout=60.0)
-        if response.status_code == 200:
-            res_json = response.json()
-            synthesis = res_json.get("response", "").strip()
-        else:
-            synthesis = f"[Synthèse indisponible]. Erreur HTTP: {response.status_code}"
+      if response.status_code == 200:
+        res_json = response.json()
+        synthesis = res_json.get("response", "").strip()
+      else:
+        synthesis = f"[Synthèse indisponible]. Erreur HTTP: {response.status_code}"
     except Exception as e:
-        synthesis = f"[Synthèse indisponible]. Erreur: {str(e)}"
-        
+      synthesis = f"[Synthèse indisponible]. Erreur: {str(e)}"
+
     enriched_data = {
         **cluster_info,
         "synthesis": synthesis,
@@ -190,7 +189,7 @@ async def generate_all_clusters_async(clusters: dict, articles_by_cluster: dict,
     """Exécute tous les appels de synthèse des clusters en parallèle simultané."""
     async with httpx.AsyncClient() as client:
         tasks = [
-            generate_single_cluster_async(client, cid, cinfo, articles_by_cluster.get(cid, []), report_lang)
+            generate_single_cluster_with_semaphore(client, cid, cinfo, articles_by_cluster.get(cid, []), report_lang)
             for cid, cinfo in clusters.items() if cid != "-1"
         ]
         results = await asyncio.gather(*tasks)
@@ -229,35 +228,24 @@ def enrich_gold_with_syntheses(gold_file: Path, run_id: str) -> Path:
     dominant_lang = max(set(languages), key=languages.count) if languages else "en"
     report_lang = "fr" if dominant_lang in ["fr", "ar"] else "en"
 
-    # === DÉFINITION DE L'EXPÉRIENCE MLFLOW ===
-    mlflow.set_experiment("marketpulse_prod")
-
     # === OUVERTURE DU RUN MLFLOW ICI ===
-    # On utilise le run_id d'Airflow pour garder la traçabilité synchronisée
-    with mlflow.start_run(run_name=f"synthesize_{run_id}") as run:
-        mlflow.set_tag("airflow_run_id", run_id)
-        mlflow.log_param("pipeline_stage", "synthesize_clusters")
-        mlflow.log_param("llm_model", "llama3")
-        mlflow.log_metric("total_clusters_to_synthesize", len([c for c in clusters.keys() if c != "-1"]))
+    # 1. Configuration sécurisée de l'expérience MLflow
+    start_time = datetime.utcnow()
+    # Générer les synthèses de tous les clusters en parallèle (ultra rapide)
+    logger.info("Lancement des synthèses de clusters en parallèle...")
+    enriched_clusters = asyncio.run(
+        generate_all_clusters_async(clusters, articles_by_cluster, report_lang)
+    )
 
-        # Initialisation correcte du chronomètre avant l'appel asynchrone
-        start_time = datetime.utcnow()
-
-        # Générer les synthèses de tous les clusters en parallèle (ultra rapide)
-        logger.info("Lancement des synthèses de clusters en parallèle...")
-        enriched_clusters = asyncio.run(
-            generate_all_clusters_async(clusters, articles_by_cluster, report_lang)
-        )
-
-        # Calcul sécurisé de la durée
-        duration = (datetime.utcnow() - start_time).total_seconds()
-        mlflow.log_metric("async_synthesis_duration_seconds", duration)
-        logger.success("Toutes les synthèses de clusters ont été générées en parallèle !")
+    # Calcul sécurisé de la durée
+    duration = (datetime.utcnow() - start_time).total_seconds()
+    logger.success("Toutes les synthèses de clusters ont été générées en parallèle !")
 
         # Rapport global
-        global_summary = generate_global_report(
-            enriched_clusters, gold_data["stats"]["total_articles"]
-        )
+    global_summary = generate_global_report(
+        enriched_clusters, gold_data["stats"]["total_articles"]
+    )
+
 
     # Rapport final
     report = {
@@ -296,4 +284,22 @@ def enrich_gold_with_syntheses(gold_file: Path, run_id: str) -> Path:
         json.dump(report, f, ensure_ascii=False, indent=2)
 
     logger.success(f"Rapport final généré: {output_file}")
+
+    # 5. Télémétrie MLflow (Non-bloquante)
+
+    try:
+        # Configuration locale à l'exécution de la tâche (pas en haut du fichier !)
+        mlflow.set_tracking_uri(os.getenv("MLFLOW_TRACKING_URI", "http://mlflow:5000"))
+        mlflow.set_experiment("marketpulse_prod")
+
+        with mlflow.start_run(run_name=f"synthesize_{run_id}") as run:
+            mlflow.set_tag("airflow_run_id", run_id)
+            mlflow.log_param("pipeline_stage", "synthesize_clusters")
+            mlflow.log_param("llm_model", "llama3")
+            mlflow.log_metric("total_clusters_to_synthesize", len([c for c in clusters.keys() if c != "-1"]))
+            mlflow.log_metric("async_synthesis_duration_seconds", duration)
+            logger.info("📊 Métriques enregistrées avec succès dans MLflow.")
+    except Exception as e:
+        logger.error(f"⚠️ MLflow tracking server unreachable (503/Timeout): {e}. Poursuite du pipeline sans télémétrie.")
+
     return output_file

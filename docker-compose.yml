@@ -1,4 +1,4 @@
-# MarketPulse — Docker Compose
+ # MarketPulse — Docker Compose
 # Déploiement complet sur Oracle Cloud Free Tier (A1.Flex 4 OCPU / 24 GB RAM)
 
 services:
@@ -13,6 +13,7 @@ services:
       POSTGRES_DB: marketpulse_db
     volumes:
       - postgres_data:/var/lib/postgresql/data
+      - ./init-db.sql:/docker-entrypoint-initdb.d/init-db.sql
     ports:
       - "5432:5432"
     healthcheck:
@@ -31,24 +32,29 @@ services:
     volumes:
       - ./mlflow_data:/mlflow
     environment:
-      - MLFLOW_TRACKING_URI=http://marketpulse_mlflow_v2:5000
+      - MLFLOW_TRACKING_URI=http://mlflow:5000
+      - MLFLOW_BACKEND_STORE_URI=postgresql://marketpulse:mp_secure_2024@postgres:5432/marketpulse_db
+      - MLFLOW_ARTIFACT_ROOT=/mlflow/artifacts
     command: >
       mlflow server
-      --backend-store-uri sqlite:////mlflow/mlflow.db
+      --backend-store-uri postgresql://marketpulse:mp_secure_2024@postgres:5432/marketpulse_db
       --default-artifact-root /mlflow/artifacts
       --host 0.0.0.0
       --port 5000
       --allowed-hosts "*"
+    depends_on:
+      postgres:
+        condition: service_healthy
     restart: always
 
 # — Apache Airflow : Service d'initialisation automatique —
   airflow-init:
-    image: apache/airflow:2.10.0
+    build: .
     container_name: marketpulse-airflow-init
     depends_on:
       postgres:
         condition: service_healthy
-    volumes: &airflow-volumes # <--- MODIFIÉ : Ancre de volumes définie ici pour monter les répertoires dès la phase d'init
+    volumes: &airflow-volumes
       - ./dags:/opt/airflow/dags
       - ./collectors:/opt/airflow/dags/collectors
       - ./nlp:/opt/airflow/dags/nlp
@@ -59,14 +65,14 @@ services:
       - ./models:/opt/airflow/models
     environment:
       AIRFLOW__CORE__EXECUTOR: LocalExecutor
-      AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://marketpulse:mp_secure_2024@marketpulse_postgres_v2:5432/marketpulse_db
+      AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://marketpulse:mp_secure_2024@postgres:5432/airflow_db
       AIRFLOW__CORE__LOAD_EXAMPLES: 'False'
       AIRFLOW__WEBSERVER__SECRET_KEY: marketpulse_secret_key_2024
       AIRFLOW__LOGGING__LOGGING_LEVEL: INFO
       BRONZE_PATH: /opt/airflow/data/bronze
       SILVER_PATH: /opt/airflow/data/silver
       GOLD_PATH: /opt/airflow/data/gold
-      MLFLOW_TRACKING_URI: http://marketpulse_mlflow_v2:5000
+      MLFLOW_TRACKING_URI: http://mlflow:5000
       _AIRFLOW_DB_UPGRADE: 'true'
       _AIRFLOW_WWW_USER_CREATE: 'true'
       _AIRFLOW_WWW_USER_USERNAME: admin
@@ -93,14 +99,14 @@ services:
     volumes: *airflow-volumes
     environment:
       - AIRFLOW__CORE__EXECUTOR=LocalExecutor
-      - AIRFLOW__DATABASE__SQL_ALCHEMY_CONN=postgresql+psycopg2://marketpulse:mp_secure_2024@marketpulse_postgres_v2:5432/marketpulse_db
+      - AIRFLOW__DATABASE__SQL_ALCHEMY_CONN=postgresql+psycopg2://marketpulse:mp_secure_2024@postgres:5432/airflow_db
       - AIRFLOW__CORE__LOAD_EXAMPLES=False
       - AIRFLOW__WEBSERVER__SECRET_KEY=marketpulse_secret_key_2024
       - AIRFLOW__LOGGING__LOGGING_LEVEL=INFO
       - BRONZE_PATH=/opt/airflow/data/bronze
       - SILVER_PATH=/opt/airflow/data/silver
       - GOLD_PATH=/opt/airflow/data/gold
-      - MLFLOW_TRACKING_URI=http://marketpulse_mlflow_v2:5000
+      - MLFLOW_TRACKING_URI=http://mlflow:5000
       - GIT_PYTHON_REFRESH=quiet
       - HF_HOME=/opt/airflow/models
       - TRANSFORMERS_CACHE=/opt/airflow/models
@@ -127,14 +133,14 @@ services:
     volumes: *airflow-volumes
     environment:
       - AIRFLOW__CORE__EXECUTOR=LocalExecutor
-      - AIRFLOW__DATABASE__SQL_ALCHEMY_CONN=postgresql+psycopg2://marketpulse:mp_secure_2024@marketpulse_postgres_v2:5432/marketpulse_db
+      - AIRFLOW__DATABASE__SQL_ALCHEMY_CONN=postgresql+psycopg2://marketpulse:mp_secure_2024@postgres:5432/airflow_db
       - AIRFLOW__CORE__LOAD_EXAMPLES=False
       - AIRFLOW__WEBSERVER__SECRET_KEY=marketpulse_secret_key_2024
       - AIRFLOW__LOGGING__LOGGING_LEVEL=INFO
       - BRONZE_PATH=/opt/airflow/data/bronze
       - SILVER_PATH=/opt/airflow/data/silver
       - GOLD_PATH=/opt/airflow/data/gold
-      - MLFLOW_TRACKING_URI=http://marketpulse_mlflow_v2:5000
+      - MLFLOW_TRACKING_URI=http://mlflow:5000
       - GIT_PYTHON_REFRESH=quiet
       - HF_HOME=/opt/airflow/models
       - TRANSFORMERS_CACHE=/opt/airflow/models
@@ -201,6 +207,7 @@ services:
 volumes:
   postgres_data:
   ollama_data:
+  mlflow_data:
 
 networks:
   default:

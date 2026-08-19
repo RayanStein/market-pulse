@@ -11,6 +11,8 @@ from datetime import datetime
 from collections import Counter
 from typing import Optional
 from loguru import logger
+from nlp.utils import MULTILINGUAL_STOPWORDS
+
 
 try:
     import hdbscan
@@ -96,52 +98,6 @@ def reduce_for_viz(embeddings: np.ndarray, n_components: int = 2) -> np.ndarray:
 
 # ─── Labeling automatique ────────────────────────────────────────────────────
 # Stopwords combinés (Français, Anglais, Allemand + bruits courants du web)
-MULTILINGUAL_STOPWORDS = [
-    # Anglais
-    "the", "a", "an", "in", "on", "at", "for", "to", "with", "by", "is", "are", 
-    "was", "were", "and", "or", "but", "of", "from", "its", "it", "as", "that", 
-    "this", "they", "will", "says", "said", "can", "has", "have", "not",
-
-    # Français
-    "le", "la", "les", "un", "une", "des", "de", "du", "et", "en", "à", "au", 
-    "aux", "que", "qui", "ce", "cette", "ces", "dans", "sur", "par", "pour", 
-    "pas", "plus", "sont", "est", "ou", "mais", "ont", "fait",
-
-    # Allemand (Complété avec pronoms et auxiliaires)
-    "der", "die", "das", "ein", "eine", "einen", "einem", "einer", "eines", "und", 
-    "in", "im", "von", "zu", "den", "mit", "sich", "auf", "für", "ist", "nicht", 
-    "nach", "wie", "als", "auch", "es", "an", "werden", "aus", "außer",
-    "ich", "du", "er", "sie", "wir", "ihr", "mich", "dich", "ihn", "uns", "euch", "ihnen",
-    "dem", "des", "über", "unter", "durch", "gegen", "ohne", "um", "oder", "aber", 
-    "denn", "weil", "dass", "wenn", "so", "nur", "noch", "schon", "sind", "war", 
-    "waren", "sein", "wird", "wurde", "wurden", "haben", "hat", "hatte", "hatten",
-
-    # Bruit d'actualités / Métadonnées Scraping
-    "promo", "off", "august", "auguste", "save", "deals", "code", "codes", "discount",
-
-    # Bruit Temporel (Jours, mois, saisons)
-    "jour", "jours", "day", "days", "tag", "tage", "يوم", "أيام",
-    "mois", "month", "months", "monat", "monate", "شهر", "شهور", "أشهر",
-    "année", "year", "years", "jahr", "jahre", "سنة", "سنوات", "عام", "أعوام",
-    "saison", "season", "seasons", "موسم", "مواسم",
-    "aujourd", "hui", "today", "heute", "demain", "hier", "اليوم", "غدا", "أمس",
-
-    # Superlatifs & Qualificatifs génériques
-    "good", "best", "better", "bad", "worst", "great",
-    "bon", "meilleur", "pire", "bien", "très",
-    "gut", "besser", "beste", "schlecht",
-    "جيد", "أفضل", "أحسن", "سيء", "أسوأ", "عظيم", "ممتاز", "جدا",
-
-    # Bruit Marketing & E-commerce complémentaire
-    "annonce", "annonces", "ad", "ads", "advertisement", "إعلان", "إعلانات",
-    "gratuit", "free", "premium", "sponsor", "sponsored", "مجاني", "مجانا", "مميز", "ممول", "برعاية",
-    "abonnement", "subscribe", "newsletter", "cliquez", "click", "اشتراك", "اشترك", "نشرة", "إخبارية", "انقر", "اضغط",
-
-    # Arabe (mots vides fréquents, prépositions et conjonctions)
-    "في", "من", "على", "أن", "إلى", "عن", "هذا", "هذه", "التي", "الذي", 
-    "ففي", "ولكن", "مع", "هل", "قد", "بل", "لا", "ما", "لم", "لن", 
-    "هو", "هي", "هم", "هن", "أنت", "أنتم", "نحن", "وإلى", "وكما", "أو"
-]
 def label_cluster(articles_in_cluster: list[dict]) -> str:
     """
     Génère automatiquement un label pour un cluster en extrayant 
@@ -235,6 +191,8 @@ def run_clustering(silver_file: Path, run_id: str) -> Path:
     """
     logger.info(f"Clustering: {silver_file}")
 
+    MLFLOW_URI = os.getenv("MLFLOW_TRACKING_URI", "http://mlflow:5000")
+
     with open(silver_file, "r", encoding="utf-8") as f:
         articles = json.load(f)
 
@@ -288,6 +246,7 @@ def run_clustering(silver_file: Path, run_id: str) -> Path:
     # MLflow tracking
     try:
         mlflow.set_tracking_uri(MLFLOW_URI)
+        mlflow.set_experiment("marketpulse_prod")
         with mlflow.start_run(run_name=f"clustering_{run_id}"):
             mlflow.log_param("algorithm",
                              "hdbscan" if HDBSCAN_AVAILABLE and len(articles) >= 10 else "kmeans")
@@ -298,9 +257,9 @@ def run_clustering(silver_file: Path, run_id: str) -> Path:
                 "outlier_rate", round(n_outliers / len(articles), 3)
             )
             mlflow.log_metric("silhouette_score", silhouette_val)
-
+            logger.success("Métriques de traçabilité MLOps enregistrées dans MLflow avec succès.")
     except Exception as e:
-        logger.warning(f"MLflow non disponible: {e}")
+        logger.warning(f"⚠️ Avertissement MLflow : Impossible de joindre le serveur de tracking ({e}). Poursuite du pipeline en mode dégradé.")
 
     # Construction Gold
     gold_data = {
