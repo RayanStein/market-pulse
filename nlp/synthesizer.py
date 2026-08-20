@@ -165,18 +165,34 @@ async def generate_single_cluster_with_semaphore(client: httpx.AsyncClient, clus
         "stream": False
     }
 
-    try:
-      # Le sémaphore protège l'appel critique pour ne pas saturer le serveur Ollama
-      async with _ollama_semaphore:
-        # Appel HTTP asynchrone direct sur l'API d'Ollama
-        response = await client.post("http://ollama:11434/api/generate", json=payload, timeout=60.0)
-      if response.status_code == 200:
-        res_json = response.json()
-        synthesis = res_json.get("response", "").strip()
-      else:
-        synthesis = f"[Synthèse indisponible]. Erreur HTTP: {response.status_code}"
-    except Exception as e:
-      synthesis = f"[Synthèse indisponible]. Erreur: {str(e)}"
+    synthesis = None
+    max_retries = 3
+    backoff_factor = 2.0  # Délai exponentiel entre les tentatives (2s, 4s...)
+
+
+
+    for attempt in range(1, max_retries + 1):
+        try:
+            # Le sémaphore protège l'appel critique pour ne pas saturer le serveur Ollama
+            async with _ollama_semaphore:
+                # Appel HTTP asynchrone direct sur l'API d'Ollama
+                response = await client.post("http://ollama:11434/api/generate", json=payload, timeout=120.0)
+            if response.status_code == 200:
+                res_json = response.json()
+                synthesis = res_json.get("response", "").strip()
+                if synthesis:
+                    break  # Succès, on sort de la boucle de retry
+            else:
+                logger.warning(f"[Tentative {attempt}/{max_retries}] Erreur HTTP Ollama {response.status_code} pour le cluster {cluster_label}")
+        except Exception as e:
+            logger.warning(f"[Tentative {attempt}/{max_retries}] Timeout/Erreur technique pour {cluster_label}: {e}")
+            if attempt < max_retries:
+                await asyncio.sleep(backoff_factor ** attempt)
+
+    # Si après les retries le LLM n'a vraiment pas répondu, on trace l'état technique proprement
+    if not synthesis:
+        synthesis = "[Synthèse en cours de génération - File d'attente LLM saturée]"
+        logger.error(f"Échec définitif d'inférence pour le cluster {cluster_label} après {max_retries} essais.")
 
     enriched_data = {
         **cluster_info,
