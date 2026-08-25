@@ -13,7 +13,6 @@ from typing import Optional
 from loguru import logger
 from nlp.utils import MULTILINGUAL_STOPWORDS
 
-
 try:
     import hdbscan
     HDBSCAN_AVAILABLE = True
@@ -37,28 +36,49 @@ N_MAX = int(os.getenv("N_CLUSTERS_MAX", 15))
 # ─── Clustering ─────────────────────────────────────────────────────────────
 
 def cluster_hdbscan(embeddings: np.ndarray,
-                    min_cluster_size: int = 3) -> np.ndarray:
+                    min_cluster_size: int = 8,min_samples: int = 2) -> np.ndarray:
     """
     Clustering HDBSCAN — détecte automatiquement le nombre de clusters.
     Idéal pour des corpus de taille variable.
     Les articles avec label=-1 sont des outliers (non assignés).
+
+    Clustering HDBSCAN avec normalisation L2 préalable pour forcer 
+    un comportement cosinus tout en gardant 'euclidean'.
     """
+
+    # Normalisation L2 : indispensable pour que la distance euclidienne réagisse comme une similarité cosinus sur des embeddings SBERT.
+    norms = np.linalg.norm(embeddings, axis=1, keepdims=True)
+    norms[norms == 0] = 1.0  # Évite la division par zéro
+    embeddings_normalized = embeddings / norms
+
     clusterer = hdbscan.HDBSCAN(
         min_cluster_size=min_cluster_size,
-        min_samples=2,
-        metric="cosine",
+        min_samples=min_samples,
+        metric="euclidean",
         cluster_selection_method="eom",
         prediction_data=True,
     )
-    labels = clusterer.fit_predict(embeddings)
+    labels = clusterer.fit_predict(embeddings_normalized)
     n_clusters = len(set(labels)) - (1 if -1 in labels else 0)
     n_noise = list(labels).count(-1)
-    logger.info(
-        f"HDBSCAN: {n_clusters} clusters, {n_noise} outliers"
-        f" sur {len(embeddings)} articles"
-    )
-    return labels
+    noise_ratio = n_noise / len(embeddings)
+    # Garde-fou MLOps : si HDBSCAN est inopérant sur ce batch, fallback propre sur KMeans
+    if n_clusters < 3 or noise_ratio > 0.40:
+        logger.warning(
+            f"⚠️ HDBSCAN inopérant ({n_clusters} clusters, {n_noise} bruits [{noise_ratio:.1%}]). "
+            "Basculement automatique sur KMeans optimal."
+        )
+        kmeans_labels, silhouette_val = cluster_kmeans_optimal(embeddings_normalized)
+        return kmeans_labels, silhouette_val
 
+    # Calcul de la silhouette pour HDBSCAN si valide
+    try:
+        silhouette_val = float(silhouette_score(embeddings_normalized, labels, sample_size=min(500, len(embeddings))))
+    except Exception:
+        silhouette_val = 0.0
+
+    logger.info(f"HDBSCAN Validé (Normalisé L2): {n_clusters} clusters, {n_noise} outliers sur {len(embeddings)} articles")
+    return labels, silhouette_val
 
 def cluster_kmeans_optimal(embeddings: np.ndarray) -> tuple[np.ndarray, float]:
     """
@@ -102,45 +122,52 @@ def label_cluster(articles_in_cluster: list[dict]) -> str:
     """
     Génère automatiquement un label pour un cluster en extrayant 
     les termes les plus pertinents via CountVectorizer (bigrammes inclus) 
-    tout en filtrant les stopwords multilingues.
+    tout en filtrant les stopwords multilingues avec un fallback garanti sur des mots-clés 
+    et non sur un titre brut.
     """
     texts = [art.get("title", "") for art in articles_in_cluster if art.get("title")]
     if not texts:
-        return "Thème divers"
+        return "divers · general"
 
     try:
         # Configuration d'un vectoriseur textuel robuste sur les titres
         vectorizer = CountVectorizer(
-            stop_words=MULTILINGUAL_STOPWORDS,
+            stop_words=list(MULTILINGUAL_STOPWORDS),
             ngram_range=(1, 2),
             min_df=1,
             max_df=0.95,
             token_pattern=r'(?u)\b([a-zA-ZÀ-ÿ]{3,}|[\u0600-\u06FF]{2,})\b' 
             # Note : min 3 lettres pour le latin, min 2 caractères pour l'arabe (les mots en arabe sont souvent plus courts morphologiquement)
         )
-        
+
         X = vectorizer.fit_transform(texts)
         sum_words = X.sum(axis=0)
-        
+
         words_freq = [
             (word, sum_words[0, idx]) 
             for word, idx in vectorizer.vocabulary_.items()
         ]
-        
+
         # Trier par fréquence décroissante
         words_freq = sorted(words_freq, key=lambda x: x[1], reverse=True)
-        
+
         # Conserver le top 3 des mots/bigrammes les plus discriminants
         top_words = [w[0] for w in words_freq[:3]]
-        
-        if not top_words:
-            return texts[0][:40] + "..."
-            
-        return " · ".join(top_words)
-        
+
+        if top_words:
+            return " · ".join(top_words)
+
+
     except Exception as e:
-        logger.warning(f"Erreur lors du labeling automatique: {e}. Fallback titre.")
-        return texts[0][:40] + "..."
+        logger.warning(f"Erreur lors du labeling automatique: {e}. Fallback mots-clés.")
+
+    # Fallback propre orienté mots-clés (jamais de phrase brute)
+    words = [
+        w.lower() for w in texts[0].split()
+        if len(w) > 3 and w.lower() not in MULTILINGUAL_STOPWORDS
+    ]
+    fallback_words = words[:3] if words else ["cluster", "analyse"]
+    return " · ".join(fallback_words)
 
 def assign_clusters(articles: list[dict],
                     labels: np.ndarray) -> tuple[list[dict], dict]:
@@ -191,8 +218,6 @@ def run_clustering(silver_file: Path, run_id: str) -> Path:
     """
     logger.info(f"Clustering: {silver_file}")
 
-    MLFLOW_URI = os.getenv("MLFLOW_TRACKING_URI", "http://mlflow:5000")
-
     with open(silver_file, "r", encoding="utf-8") as f:
         articles = json.load(f)
 
@@ -204,9 +229,9 @@ def run_clustering(silver_file: Path, run_id: str) -> Path:
     embeddings = np.array([art["embedding"] for art in articles])
 
     # Choix de l'algorithme avec score silhouette garanti
-    silhouette_val = 0.0
     if HDBSCAN_AVAILABLE and len(articles) >= 10:
-        labels = cluster_hdbscan(embeddings)
+        labels, silhouette_val = cluster_hdbscan(embeddings)
+        algo_name = "hdbscan_with_fallback"
         # Calcul optionnel de la silhouette sur HDBSCAN pour les métriques MLflow
         try:
             if len(set(labels)) > 1:
@@ -215,6 +240,7 @@ def run_clustering(silver_file: Path, run_id: str) -> Path:
             silhouette_val = 0.0
     else:
         labels, silhouette_val = cluster_kmeans_optimal(embeddings)
+        algo_name = "kmeans"
     # Réduction 2D pour visualisation
     coords_2d = reduce_for_viz(embeddings)
 
@@ -247,9 +273,14 @@ def run_clustering(silver_file: Path, run_id: str) -> Path:
     try:
         mlflow.set_tracking_uri(MLFLOW_URI)
         mlflow.set_experiment("marketpulse_prod")
+        # SÉCURITÉ MLOPS : Fermeture forcée de tout run resté fantôme en mémoire
+        if mlflow.active_run():
+            logger.warning("⚠️ Run MLflow orphelin détecté. Fermeture forcée avant initialisation.")
+            mlflow.end_run()
+
         with mlflow.start_run(run_name=f"clustering_{run_id}"):
             mlflow.log_param("algorithm",
-                             "hdbscan" if HDBSCAN_AVAILABLE and len(articles) >= 10 else "kmeans")
+                             "hdbscan" if HDBSCAN_AVAILABLE and len(articles) >= 10 else algo_name)
             mlflow.log_param("n_articles", len(articles))
             mlflow.log_metric("n_clusters", n_clusters)
             mlflow.log_metric("n_outliers", n_outliers)
@@ -257,9 +288,10 @@ def run_clustering(silver_file: Path, run_id: str) -> Path:
                 "outlier_rate", round(n_outliers / len(articles), 3)
             )
             mlflow.log_metric("silhouette_score", silhouette_val)
-            logger.success("Métriques de traçabilité MLOps enregistrées dans MLflow avec succès.")
+            logger.success("✅ Métriques de traçabilité MLOps enregistrées dans MLflow avec succès.")
+
     except Exception as e:
-        logger.warning(f"⚠️ Avertissement MLflow : Impossible de joindre le serveur de tracking ({e}). Poursuite du pipeline en mode dégradé.")
+        logger.warning(f"⚠️  Avertissement MLflow : Impossible de joindre le serveur de tracking ({e}). Poursuite du pipeline en mode dégradé.")
 
     # Construction Gold
     gold_data = {

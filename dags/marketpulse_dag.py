@@ -593,26 +593,119 @@ def task_export_powerbi(**context):
 # ─── Tâche 7 : Notification ──────────────────────────────────────────────────
 
 def task_notify_email(**context):
-    """Log de fin de pipeline avec résumé."""
-    run_id = context["ti"].xcom_pull(task_ids="collect_rss", key="run_id") or "N/A"
-    article_count = context["ti"].xcom_pull(
-        task_ids="collect_rss", key="article_count"
-    ) or 0
-    # Calcul de la fenêtre d'exécution globale (~186s)
+    # Envoie un e-mail de type briefing exécutif (C-Level) incluant les KPIs,
+    # la synthèse globale (TL;DR) et le Top 5 des clusters thématiques.
+    ti = context.get("ti")
+    if not ti:
+        raise ValueError("Le TaskInstance (ti) est introuvable dans le contexte d'exécution Airflow.")
+
+    run_id = ti.xcom_pull(task_ids="collect_rss", key="run_id") or "N/A"
+    article_count = ti.xcom_pull(task_ids="collect_rss", key="article_count") or 0
+    # Calcul de la fenêtre d'exécution globale
     _, duration_str = calculate_execution_duration(context)
 
-    subject = f"✅ [MarketPulse] Pipeline Terminé | {article_count} Articles | Durée: {duration_str}"
-    body = f"""
-    <h2>Rapport de Succès MarketPulse</h2>
-    <p>• <b>Run ID :</b> {run_id}</p>
-    <p>• <b>Articles Traités :</b> {article_count}</p>
-    <p>• <b>Durée globale d'exécution (SLA) :</b> {duration_str}</p>
-    """
+    # Valeurs par défaut de repli (Fallback)
+    global_summary = "Synthese globale non disponible pour ce run."
+    total_valid_clusters = 0
+    noise_count = 0
+    top_clusters_html = ""
+
+    try:
+        # Récupération automatique du dernier rapport JSON produit dans le dossier gold
+        report_file = ti.xcom_pull(task_ids="synthesize_clusters")
+        # Fallback de secours si l'XCom est absent (ex: exécution isolée CLI)
+        if not report_file or not os.path.exists(report_file):
+            logger.warning(f"⚠️ XCom vide ou fichier introuvable via XCom ({report_file}). Lancement du scan glob de secours...")
+            report_files = glob.glob('/opt/airflow/data/gold/reports/*.json')
+            if report_files:
+                report_file = max(report_files, key=os.path.getctime)
+
+        if report_file and os.path.exists(report_file):
+            logger.info(f"📂 Chargement du rapport Gold depuis : {report_file}")
+            with open(report_file, 'r', encoding='utf-8') as f:
+                report_data = json.load(f)
+
+            global_summary = report_data.get("global_summary", global_summary)
+            # Récupération sécurisée du nombre total d'articles depuis les stats du rapport si l'XCom amont est vide
+            stats = report_data.get("stats", {})
+            if article_count == 0:
+                article_count = stats.get("total_articles", 0)
+
+            clusters_raw = report_data.get("clusters", {})
+            valid_clusters = {}
+
+            # [CORRECTION HYBRIDE] : Gestion robuste que 'clusters' soit un dict ou une liste
+            if isinstance(clusters_raw, dict):
+                for cid, cdata in clusters_raw.items():
+                    str_cid = str(cid)
+                    if str_cid in ("-1", "-1.0"):
+                        noise_count = cdata.get("count", 0) if isinstance(cdata, dict) else 0
+                    else:
+                        valid_clusters[str_cid] = cdata if isinstance(cdata, dict) else {}
+            elif isinstance(clusters_raw, list):
+                for item in clusters_raw:
+                    if not isinstance(item, dict):
+                        continue
+                    cid = str(item.get("cluster_id", item.get("id", item.get("cluster", "0"))))
+                    if cid in ("-1", "-1.0"):
+                        noise_count = item.get("count", 0)
+                    else:
+                        valid_clusters[cid] = item
+
+            total_valid_clusters = len(valid_clusters)
+
+            # Tri et sélection du Top 5 des clusters par volume d'articles décroissant
+            sorted_clusters = sorted(
+                valid_clusters.items(), 
+                key=lambda x: x[1].get("count", 0) if isinstance(x[1], dict) else 0,
+                reverse=True
+            )[:5]
+
+            for cid, cdata in sorted_clusters:
+                label = cdata.get("label", f"Cluster {cid}")
+                count = cdata.get("count", 0)
+                synthesis = cdata.get("synthesis", "Pas de synthese disponible.")
+
+                top_clusters_html += (
+                    '<li style="margin-bottom: 12px;">'
+                    f'<strong>[+] {label}</strong> <em>({count} articles)</em><br>'
+                    f'<span style="color: #444; font-size: 0.95em;">{synthesis}</span>'
+                    '</li>'
+                )
+        else:
+            logger.error(f"❌ Échec critique : Aucun fichier de rapport JSON valide trouvé pour le run {run_id}.")
+    except Exception as e:
+        logger.error(f"❌ Erreur critique lors du parsing du rapport JSON : {e}")
+
+    # Sujet de l'e-mail orienté C-Level en pur ASCII sécurisé
+    subject = f"[MarketPulse] Executive Briefing | {article_count} Articles | {total_valid_clusters} Themes"
+
+    # Corps HTML structuré sécurisé avec parenthèses et concaténation
+    body = (
+        '<div style="font-family: Arial, sans-serif; color: #333; max-width: 600px; margin: auto; border: 1px solid #e0e0e0; border-radius: 8px; padding: 20px;">'
+        '<h2 style="color: #0056b3; border-bottom: 2px solid #0056b3; padding-bottom: 8px;">[MarketPulse] Executive Briefing</h2>'
+        f'<p><strong>Run ID :</strong> {run_id}</p>'
+        '<div style="background-color: #f8f9fa; border-left: 4px solid #28a745; padding: 12px; margin: 15px 0; border-radius: 4px;">'
+        '<strong>Indicateurs Cles :</strong><br>'
+        f'- Articles analyses : <strong>{article_count}</strong><br>'
+        f'- Macro-tendances (Clusters) : <strong>{total_valid_clusters}</strong><br>'
+        f'- Elements de bruit (Outliers) : <strong>{noise_count}</strong><br>'
+        f'- Duree d execution (SLA) : <strong>{duration_str}</strong>'
+        '</div>'
+        '<h3 style="color: #333; margin-top: 20px;">Synthese Strategique du Jour</h3>'
+        f'<p style="background-color: #e9ecef; padding: 12px; border-radius: 6px; font-style: italic; line-height: 1.4;">"{global_summary}"</p>'
+        '<h3 style="color: #333; margin-top: 20px;">Top 5 des Thematiques Cles</h3>'
+        f'<ul style="padding-left: 20px; line-height: 1.5;">{top_clusters_html if top_clusters_html else "<li>Aucun detail de cluster disponible.</li>"}</ul>'
+        '<hr style="border: none; border-top: 1px solid #e0e0e0; margin: 20px 0;">'
+        '<p style="font-size: 0.85em; color: #666; text-align: center;">Rapport genere automatiquement par le pipeline MLOps MarketPulse.<br>Systeme souverain de veille strategique - 100% local.</p>'
+        '</div>'
+    )
+
     try:
         send_email(to=ALERT_EMAIL, subject=subject, html_content=body)
+        logger.info("✅ E-mail exécutif C-Level envoyé avec succès !")
     except Exception as e:
-        logger.warning(f"Erreur d'envoi Email de succès : {e}")
-
+        logger.error(f"❌ Erreur d'envoi de l'e-mail de succès : {e}")
 # ─── Définition des tâches ───────────────────────────────────────────────────
 
 with dag:

@@ -203,6 +203,11 @@ async def generate_single_cluster_with_semaphore(client: httpx.AsyncClient, clus
 
 async def generate_all_clusters_async(clusters: dict, articles_by_cluster: dict, report_lang: str) -> dict:
     """Exécute tous les appels de synthèse des clusters en parallèle simultané."""
+    valid_clusters = {cid: cinfo for cid, cinfo in clusters.items() if cid != "-1"}
+    # Sécurité : si aucun cluster valide n'émerge, on intègre le groupe -1 pour sauver le rapport
+    if not valid_clusters and "-1" in clusters:
+        valid_clusters = {"-1": clusters["-1"]}
+
     async with httpx.AsyncClient() as client:
         tasks = [
             generate_single_cluster_with_semaphore(client, cid, cinfo, articles_by_cluster.get(cid, []), report_lang)
@@ -305,7 +310,7 @@ def enrich_gold_with_syntheses(gold_file: Path, run_id: str) -> Path:
 
     try:
         # Configuration locale à l'exécution de la tâche (pas en haut du fichier !)
-        mlflow.set_tracking_uri(os.getenv("MLFLOW_TRACKING_URI", "http://mlflow:5000"))
+        mlflow.set_tracking_uri(os.getenv("MLFLOW_TRACKING_URI", "http://marketpulse_mlflow_v2:5000"))
         mlflow.set_experiment("marketpulse_prod")
 
         with mlflow.start_run(run_name=f"synthesize_{run_id}") as run:

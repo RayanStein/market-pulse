@@ -182,16 +182,21 @@ def powerbi_articles():
 
 @app.get("/powerbi/clusters", tags=["Power BI"])
 def powerbi_clusters():
-    """Endpoint clusters optimisé pour Power BI."""
+    """Endpoint clusters optimisé pour Power BI avec labels courts."""
     report = get_latest_report()
     if not report:
         return {"value": []}
 
     rows = []
     for cid, cdata in report["clusters"].items():
+        raw_label = cdata.get("label", "Cluster")
+        # Nettoyage automatique : si le label est une phrase, on ne garde que les premiers mots
+        words = raw_label.split()
+        clean_label = " · ".join(words[:4]) if len(words) > 4 else raw_label
+
         rows.append({
             "cluster_id": cid,
-            "label": cdata["label"],
+            "label": clean_label,
             "article_count": cdata["count"],
             "synthesis": cdata.get("synthesis", ""),
             "sources": ", ".join(cdata.get("top_sources", [])),
