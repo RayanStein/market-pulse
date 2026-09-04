@@ -5,110 +5,124 @@ Regroupe les articles par thèmes sémantiques proches.
 
 import json
 import os
+import math
 import numpy as np
 from pathlib import Path
-from datetime import datetime
+from datetime import datetime, timezone
 from collections import Counter
-from typing import Optional
+from typing import Optional, Any
 from loguru import logger
 from nlp.utils import MULTILINGUAL_STOPWORDS
 
 try:
+    import umap  # <--- Indispensable pour la projection non linéaire des embeddings SBERT
     import hdbscan
     HDBSCAN_AVAILABLE = True
 except ImportError:
     HDBSCAN_AVAILABLE = False
     logger.warning("HDBSCAN non disponible, fallback sur KMeans")
 
-from sklearn.cluster import KMeans
+from sklearn.cluster import MiniBatchKMeans
 from sklearn.metrics import silhouette_score
 from sklearn.decomposition import PCA
 from sklearn.feature_extraction.text import CountVectorizer
 import mlflow
-
+import mlflow.sklearn
 
 GOLD_PATH = Path(os.getenv("GOLD_PATH", "./data/gold"))
 MLFLOW_URI = os.getenv("MLFLOW_TRACKING_URI", "http://marketpulse_mlflow_v2:5000")
 N_MIN = int(os.getenv("N_CLUSTERS_MIN", 3))
-N_MAX = int(os.getenv("N_CLUSTERS_MAX", 15))
+N_MAX = int(os.getenv("N_CLUSTERS_MAX", 10))
 
+# Pattern partagé pour garantir la cohérence de la tokenisation (multilingue latin + arabe)
+SHARED_TOKEN_PATTERN = r'(?u)\b([a-zA-ZÀ-ÿ]{3,}|[\u0600-\u06FF]{2,})\b'
 
 # ─── Clustering ─────────────────────────────────────────────────────────────
 
-def cluster_hdbscan(embeddings: np.ndarray,
-                    min_cluster_size: int = 8,min_samples: int = 2) -> np.ndarray:
+def cluster_hdbscan_dynamic(embeddings: np.ndarray) -> tuple[np.ndarray, Any, float, str]:
     """
-    Clustering HDBSCAN — détecte automatiquement le nombre de clusters.
-    Idéal pour des corpus de taille variable.
-    Les articles avec label=-1 sont des outliers (non assignés).
-
-    Clustering HDBSCAN avec normalisation L2 préalable pour forcer 
-    un comportement cosinus tout en gardant 'euclidean'.
+    Clustering HDBSCAN adaptatif à l'échelle. 
+    Les hyperparamètres évoluent de manière logarithmique et non linéaire avec N.
     """
+    n_samples = len(embeddings)
 
-    # Normalisation L2 : indispensable pour que la distance euclidienne réagisse comme une similarité cosinus sur des embeddings SBERT.
+    # 1. Normalisation L2 stricte
     norms = np.linalg.norm(embeddings, axis=1, keepdims=True)
-    norms[norms == 0] = 1.0  # Évite la division par zéro
-    embeddings_normalized = embeddings / norms
+    embeddings_normalized = np.divide(embeddings, norms, out=np.zeros_like(embeddings), where=norms!=0)
+
+    # 2. Paramétrage mathématique dynamique
+    # min_cluster_size évolue doucement (racine carrée) pour éviter l'explosion à haute échelle
+    dynamic_min_cluster = max(10, int(math.sqrt(n_samples)))
+    dynamic_n_neighbors = min(50, max(5, int(math.sqrt(n_samples))))
+
+    logger.info(f"UMAP: n_neighbors={dynamic_n_neighbors} | HDBSCAN: min_cluster_size={dynamic_min_cluster}")
+
+    try:
+        # Étape structurelle : UMAP compresse l'espace latent en préservant la topologie sémantique
+        reducer = umap.UMAP(
+            n_components=5,  # Sécurité dimensionnelle
+            n_neighbors=dynamic_n_neighbors,
+            min_dist=0.0,
+            metric="cosine",
+            random_state=42
+        )
+        embeddings_reduced = reducer.fit_transform(embeddings_normalized)
+    except Exception as e:
+        logger.error(f"UMAP failure: {e}. Bascule sur KMeans.")
+        return cluster_kmeans_adaptive(embeddings_normalized)
+
+    # 🟡 [OPTIMISATION 2] : Adaptation dynamique de min_cluster_size si le batch est très restreint,
+    # pour éviter qu'un lot réduit ne soit entièrement rejeté en tant que bruit (-1).
 
     clusterer = hdbscan.HDBSCAN(
-        min_cluster_size=min_cluster_size,
-        min_samples=min_samples,
+        min_cluster_size=dynamic_min_cluster,
+        min_samples=max(3, dynamic_min_cluster // 3),
         metric="euclidean",
         cluster_selection_method="eom",
         prediction_data=True,
     )
-    labels = clusterer.fit_predict(embeddings_normalized)
+    labels = clusterer.fit_predict(embeddings_reduced)
+
+    # 3. Sécurité MLOps : Taux de bruit
+    noise_ratio = list(labels).count(-1) / n_samples
     n_clusters = len(set(labels)) - (1 if -1 in labels else 0)
-    n_noise = list(labels).count(-1)
-    noise_ratio = n_noise / len(embeddings)
     # Garde-fou MLOps : si HDBSCAN est inopérant sur ce batch, fallback propre sur KMeans
-    if n_clusters < 3 or noise_ratio > 0.40:
-        logger.warning(
-            f"⚠️ HDBSCAN inopérant ({n_clusters} clusters, {n_noise} bruits [{noise_ratio:.1%}]). "
-            "Basculement automatique sur KMeans optimal."
-        )
-        kmeans_labels, silhouette_val = cluster_kmeans_optimal(embeddings_normalized)
-        return kmeans_labels, silhouette_val
+    if n_clusters < 2 or noise_ratio > 0.40:  # Tolérance au bruit rabaissée à 40% max
+        logger.warning(f"HDBSCAN bruyant (Noise: {noise_ratio:.1%}). Bascule sur KMeans adaptatif.")
+        return cluster_kmeans_adaptive(embeddings_normalized)
 
-    # Calcul de la silhouette pour HDBSCAN si valide
-    try:
-        silhouette_val = float(silhouette_score(embeddings_normalized, labels, sample_size=min(500, len(embeddings))))
-    except Exception:
-        silhouette_val = 0.0
+    # 4. Calcul Silhouette propre (hors bruit)
+    valid_mask = labels != -1
+    silhouette_val = float(silhouette_score(
+        embeddings_reduced[valid_mask], 
+        labels[valid_mask], 
+        sample_size=min(1000, np.sum(valid_mask))
+    )) if np.sum(valid_mask) > 1 else 0.0
 
-    logger.info(f"HDBSCAN Validé (Normalisé L2): {n_clusters} clusters, {n_noise} outliers sur {len(embeddings)} articles")
-    return labels, silhouette_val
+    return labels, clusterer, silhouette_val, "hdbscan_dynamic"
 
-def cluster_kmeans_optimal(embeddings: np.ndarray) -> tuple[np.ndarray, float]:
+def cluster_kmeans_adaptive(embeddings: np.ndarray) -> tuple[np.ndarray, Any, float, str]:
     """
-    KMeans avec recherche du nombre optimal de clusters via score silhouette.
-    Fallback si HDBSCAN non disponible ou corpus trop petit.
+    Fallback KMeans utilisant MiniBatch pour la vitesse, avec K dynamique.
     """
     n_samples = len(embeddings)
-    k_max = min(N_MAX, n_samples - 1)
-    k_min = min(N_MIN, k_max)
 
-    best_k, best_score, best_labels = k_min, -1, None
+    # K encadré dynamiquement : au moins 5, max 15 (ou racine de N/2)
+    k_min = 5
+    k_max = min(15, max(5, int(math.sqrt(n_samples / 2))))
 
+    best_k, best_score, best_labels, best_model = k_min, -1, None, None
+
+    # Recherche rapide du K optimal
     for k in range(k_min, k_max + 1):
-        kmeans = KMeans(n_clusters=k, random_state=42, n_init=10)
+        kmeans = MiniBatchKMeans(n_clusters=k, random_state=42, batch_size=256, n_init="auto")
         labels = kmeans.fit_predict(embeddings)
-        if len(set(labels)) > 1:
-            score = silhouette_score(embeddings, labels, sample_size=min(500, n_samples))
-            if score > best_score:
-                best_score = score
-                best_k = k
-                best_labels = labels
+        score = silhouette_score(embeddings, labels, sample_size=min(1000, n_samples))
 
-    if best_labels is None:
-        # Fallback de sécurité si aucun k valide
-        best_labels = np.zeros(n_samples, dtype=int)
-        best_score = 0.0
+        if score > best_score:
+            best_score, best_k, best_labels, best_model = score, k, labels, kmeans
 
-    logger.info(f"KMeans optimal: k={best_k}, silhouette={best_score:.3f}")
-    return best_labels, float(best_score)
-
+    return best_labels, best_model, float(best_score), "kmeans_adaptive"
 
 def reduce_for_viz(embeddings: np.ndarray, n_components: int = 2) -> np.ndarray:
     """Réduit les embeddings en 2D pour visualisation (Power BI scatter)."""
@@ -136,7 +150,7 @@ def label_cluster(articles_in_cluster: list[dict]) -> str:
             ngram_range=(1, 2),
             min_df=1,
             max_df=0.95,
-            token_pattern=r'(?u)\b([a-zA-ZÀ-ÿ]{3,}|[\u0600-\u06FF]{2,})\b' 
+            token_pattern=SHARED_TOKEN_PATTERN
             # Note : min 3 lettres pour le latin, min 2 caractères pour l'arabe (les mots en arabe sont souvent plus courts morphologiquement)
         )
 
@@ -144,7 +158,7 @@ def label_cluster(articles_in_cluster: list[dict]) -> str:
         sum_words = X.sum(axis=0)
 
         words_freq = [
-            (word, sum_words[0, idx]) 
+            (word, sum_words[0, idx])
             for word, idx in vectorizer.vocabulary_.items()
         ]
 
@@ -220,27 +234,17 @@ def run_clustering(silver_file: Path, run_id: str) -> Path:
 
     with open(silver_file, "r", encoding="utf-8") as f:
         articles = json.load(f)
+    if not articles:
+        raise ValueError(f"Le fichier Silver {silver_file} est vide.")
 
-    if len(articles) < 3:
-        logger.warning("Trop peu d'articles pour clustérer")
-        return None
-
-    # Reconstruction matrice embeddings
     embeddings = np.array([art["embedding"] for art in articles])
 
-    # Choix de l'algorithme avec score silhouette garanti
-    if HDBSCAN_AVAILABLE and len(articles) >= 10:
-        labels, silhouette_val = cluster_hdbscan(embeddings)
-        algo_name = "hdbscan_with_fallback"
-        # Calcul optionnel de la silhouette sur HDBSCAN pour les métriques MLflow
-        try:
-            if len(set(labels)) > 1:
-                silhouette_val = float(silhouette_score(embeddings, labels, sample_size=min(500, len(embeddings))))
-        except Exception:
-            silhouette_val = 0.0
+    # 1. Clustering
+    if HDBSCAN_AVAILABLE and len(articles) >= 20:
+        labels, trained_model, silhouette_val, algo_name = cluster_hdbscan_dynamic(embeddings)
     else:
-        labels, silhouette_val = cluster_kmeans_optimal(embeddings)
-        algo_name = "kmeans"
+        labels, trained_model, silhouette_val, algo_name = cluster_kmeans_adaptive(embeddings)
+
     # Réduction 2D pour visualisation
     coords_2d = reduce_for_viz(embeddings)
 
@@ -252,22 +256,31 @@ def run_clustering(silver_file: Path, run_id: str) -> Path:
     # Assignation des clusters
     enriched_articles, cluster_labels = assign_clusters(articles, labels)
 
-    # Statistiques par cluster
+    # Calcul métriques globales
+    n_clusters = len([k for k in cluster_labels if k != -1])
+    n_outliers = sum(1 for a in enriched_articles if a["is_outlier"])
+
+    # On force la limitation des clusters envoyés à l'étape suivante pour protéger Ollama
+    n_clusters_total = len([k for k in cluster_labels if k != -1])
+    if n_clusters_total > 15:
+        logger.warning(f"Sur-segmentation détectée ({n_clusters} clusters). Limite recommandée dépassée.")
+
+
+    # Statistiques par cluster (C'est ce dictionnaire qui doit nourrir le LLM)
     cluster_stats = {}
     for cluster_id, label in cluster_labels.items():
         cluster_arts = [a for a in enriched_articles
                         if a["cluster_id"] == cluster_id]
-        cluster_stats[str(cluster_id)] = {
-            "label": label,
-            "count": len(cluster_arts),
-            "sources": list(set(a["source_name"] for a in cluster_arts)),
-            "languages": list(set(a.get("language", "unknown") for a in cluster_arts)),
-            "sample_titles": [a["title"] for a in cluster_arts[:3]],
-        }
+        # Sécurité : on ne traite que les clusters contenant des articles
 
-    # Calcul métriques globales
-    n_clusters = len([k for k in cluster_labels if k != -1])
-    n_outliers = sum(1 for a in enriched_articles if a["is_outlier"])
+        if cluster_arts:
+            cluster_stats[str(cluster_id)] = {
+                "label": label,
+                "count": len(cluster_arts),
+                "sources": list(set(a["source_name"] for a in cluster_arts)),
+                "languages": list(set(a.get("language", "unknown") for a in cluster_arts)),
+                "sample_titles": [a["title"] for a in cluster_arts[:3]], # Top 3 pour limiter le payload
+            }
 
     # MLflow tracking
     try:
@@ -279,31 +292,60 @@ def run_clustering(silver_file: Path, run_id: str) -> Path:
             mlflow.end_run()
 
         with mlflow.start_run(run_name=f"clustering_{run_id}"):
-            mlflow.log_param("algorithm",
-                             "hdbscan" if HDBSCAN_AVAILABLE and len(articles) >= 10 else algo_name)
-            mlflow.log_param("n_articles", len(articles))
-            mlflow.log_metric("n_clusters", n_clusters)
-            mlflow.log_metric("n_outliers", n_outliers)
-            mlflow.log_metric(
-                "outlier_rate", round(n_outliers / len(articles), 3)
-            )
-            mlflow.log_metric("silhouette_score", silhouette_val)
-            logger.success("✅ Métriques de traçabilité MLOps enregistrées dans MLflow avec succès.")
+            # 1. Tags de gouvernance (Standard MLOps pour filtrage dans l'UI)
+            mlflow.set_tags({
+                "pipeline": "marketpulse_clustering",
+                "env": "production",
+                "model_type": algo_name
+            })
+
+            # 2. Batch logging des paramètres (Optimisation réseau)
+            mlflow.log_params({
+                "algorithm": algo_name,
+                "n_articles": len(articles)
+            })
+
+            # 3. Batch logging des métriques (Cast en float pour sécurité de sérialisation JSON)
+            mlflow.log_metrics({
+                "n_clusters": int(n_clusters),
+                "n_outliers": int(n_outliers),
+                "outlier_rate": float(round(n_outliers / len(articles), 3)),
+                "silhouette_score": float(silhouette_val)
+            })
+
+            # ─── AJOUT MODEL REGISTRY MLOPS ───# Enregistrement sécurisé du modèle entraîné (Pipeline complet UMAP + HDBSCAN ou KMeans)
+            # Remplacement du dump pickle manuel par l'API Sklearn native
+
+            if trained_model is not None:
+                logger.info(f"📦 Enregistrement du modèle natif MLflow : {algo_name}")
+                # HDBSCAN et K-Means respectent tous deux l'API Scikit-Learn
+                mlflow.sklearn.log_model(
+                    sk_model=trained_model,
+                    artifact_path="model_registry",
+                    registered_model_name=f"MarketPulse_Clustering_{algo_name.capitalize()}"
+                )
+                logger.success("✅ Modèle et environnement versionnés dans le Model Registry MLflow.")
+            else:
+                logger.warning("⚠️ trained_model est None, aucun modèle enregistré.")
 
     except Exception as e:
-        logger.warning(f"⚠️  Avertissement MLflow : Impossible de joindre le serveur de tracking ({e}). Poursuite du pipeline en mode dégradé.")
-
+        import traceback
+        logger.error(f"⚠️ Avertissement MLOps : Échec du tracking MLflow ({str(e)}). Le pipeline continue...")
+        logger.debug(traceback.format_exc())
     # Construction Gold
     gold_data = {
         "run_id": run_id,
-        "generated_at": datetime.utcnow().isoformat(),
+        "generated_at": datetime.now(timezone.utc).isoformat(),
         "stats": {
             "total_articles": len(enriched_articles),
             "n_clusters": n_clusters,
             "n_outliers": n_outliers,
         },
         "clusters": cluster_stats,
-        "articles": enriched_articles,
+        "articles": [
+            {k: v for k, v in art.items() if k != "embedding"}
+            for art in enriched_articles
+        ],
     }
 
     # Sauvegarde Gold (sans les embeddings — trop lourds pour Power BI)

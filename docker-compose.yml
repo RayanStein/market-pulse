@@ -63,6 +63,7 @@ services:
       - ./exports:/opt/airflow/exports
       - ./.git:/opt/airflow/.git:ro # <--- AJOUT CRUCIAL pour la traçabilité Git MLflow
       - ./models:/opt/airflow/models
+      - ./mlflow_data:/mlflow
     environment:
       AIRFLOW__CORE__EXECUTOR: LocalExecutor
       AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://marketpulse:mp_secure_2024@postgres:5432/airflow_db
@@ -73,6 +74,7 @@ services:
       SILVER_PATH: /opt/airflow/data/silver
       GOLD_PATH: /opt/airflow/data/gold
       MLFLOW_TRACKING_URI: http://mlflow:5000
+      MLFLOW_ARTIFACT_ROOT: /mlflow/artifacts
       _AIRFLOW_DB_UPGRADE: 'true'
       _AIRFLOW_WWW_USER_CREATE: 'true'
       _AIRFLOW_WWW_USER_USERNAME: admin
@@ -118,6 +120,7 @@ services:
       - AIRFLOW__SMTP__SMTP_STARTTLS=True
       - AIRFLOW__SMTP__SMTP_SSL=False
       - AIRFLOW__EMAIL__EMAIL_BACKEND=airflow.utils.email.send_email_smtp
+      - MLFLOW_ARTIFACT_ROOT=/mlflow/artifacts
     depends_on:
       postgres:
         condition: service_healthy
@@ -152,6 +155,7 @@ services:
       - AIRFLOW__SMTP__SMTP_STARTTLS=True
       - AIRFLOW__SMTP__SMTP_SSL=False
       - AIRFLOW__EMAIL__EMAIL_BACKEND=airflow.utils.email.send_email_smtp
+      - MLFLOW_ARTIFACT_ROOT=/mlflow/artifacts
     depends_on:
       postgres:
         condition: service_healthy
