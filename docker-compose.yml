@@ -30,9 +30,8 @@ services:
     ports:
       - "5000:5000"
     volumes:
-      - ./mlflow_data:/mlflow
+      - mlflow_data:/mlflow
     environment:
-      - MLFLOW_TRACKING_URI=http://mlflow:5000
       - MLFLOW_BACKEND_STORE_URI=postgresql://marketpulse:mp_secure_2024@postgres:5432/marketpulse_db
       - MLFLOW_ARTIFACT_ROOT=/mlflow/artifacts
     command: >
@@ -63,7 +62,7 @@ services:
       - ./exports:/opt/airflow/exports
       - ./.git:/opt/airflow/.git:ro # <--- AJOUT CRUCIAL pour la traçabilité Git MLflow
       - ./models:/opt/airflow/models
-      - ./mlflow_data:/mlflow
+      - mlflow_data:/mlflow
     environment:
       AIRFLOW__CORE__EXECUTOR: LocalExecutor
       AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://marketpulse:mp_secure_2024@postgres:5432/airflow_db
@@ -73,7 +72,7 @@ services:
       BRONZE_PATH: /opt/airflow/data/bronze
       SILVER_PATH: /opt/airflow/data/silver
       GOLD_PATH: /opt/airflow/data/gold
-      MLFLOW_TRACKING_URI: http://mlflow:5000
+      MLFLOW_TRACKING_URI: http://marketpulse_mlflow_v2:5000
       MLFLOW_ARTIFACT_ROOT: /mlflow/artifacts
       _AIRFLOW_DB_UPGRADE: 'true'
       _AIRFLOW_WWW_USER_CREATE: 'true'
@@ -108,7 +107,7 @@ services:
       - BRONZE_PATH=/opt/airflow/data/bronze
       - SILVER_PATH=/opt/airflow/data/silver
       - GOLD_PATH=/opt/airflow/data/gold
-      - MLFLOW_TRACKING_URI=http://mlflow:5000
+      - MLFLOW_TRACKING_URI=http://marketpulse_mlflow_v2:5000
       - GIT_PYTHON_REFRESH=quiet
       - HF_HOME=/opt/airflow/models
       - TRANSFORMERS_CACHE=/opt/airflow/models
@@ -143,7 +142,7 @@ services:
       - BRONZE_PATH=/opt/airflow/data/bronze
       - SILVER_PATH=/opt/airflow/data/silver
       - GOLD_PATH=/opt/airflow/data/gold
-      - MLFLOW_TRACKING_URI=http://mlflow:5000
+      - MLFLOW_TRACKING_URI=http://marketpulse_mlflow_v2:5000
       - GIT_PYTHON_REFRESH=quiet
       - HF_HOME=/opt/airflow/models
       - TRANSFORMERS_CACHE=/opt/airflow/models
